@@ -3,18 +3,30 @@
 // Every coin is watched from its CreateEvent. In its first slots the bot
 // reads the opening tape: how many distinct wallets bought in (a launch
 // nobody crowds into rarely runs), whether the creator has already sold,
-// how much real SOL the curve holds, and how far the price has run up
-// from its create price. It buys only launches that pass all of those,
-// one small stake per coin, then exits on a tiered take-profit ladder, a
-// hard stop, a trailing stop, a max hold, a stale tape, or a creator sell
-// while held. A pure function of the batches it is fed: no clock, no
-// randomness, no I/O.
+// how much real SOL the curve holds, how far the price has run up from
+// its create price, and whether early selling already looks like a dump
+// (one wallet selling a large share of the reserve, or sellers in total
+// outweighing half of what buyers put in). It buys only launches that
+// pass all of those, one small stake per coin, then exits on a single
+// +15% take-profit, a -10% hard stop, a 10-slot max hold, or a creator
+// sell while held. A pure function of the batches it is fed: no clock,
+// no randomness, no I/O.
 //
-// Parameter defaults are the measured best set from the local sweep on
-// the dev window (concept and initial set by Mistral; values tuned and
-// holdout-checked with the kit's market model, see the sweep notes in the
-// repo's commit history); the sweep harness overrides individual knobs
-// through createStrategy.
+// What is deliberately NOT here, because the dev window measured it as
+// harmful or dead weight (kit market model + the official grade-local
+// stress copies): no buy-slippage cap (with 2-slot fill latency the cap
+// rejects exactly the fast runners this strategy lives on), no trailing
+// stop (the +15% take-profit always fires first, so a trail can never
+// bind), no stale-tape exit and no recent-flow gate (at decision ages
+// 0-3 slots they never bound). Buy slippage stays uncapped for that
+// measured reason, not by oversight.
+//
+// Parameters were tuned on the dev window only and checked on the
+// window's second half and on grade-local's 20 rebuilt stress copies.
+// The shipped set is the best measured variant — it lifts the dev score
+// and the second-half holdout several-fold and survives doubled fees —
+// but the stress copies still lean negative, so it is a least-bad
+// honest set, not a proven edge.
 
 import { BPS, type BotState, type Batch, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 
@@ -48,10 +60,6 @@ export interface Params {
   /** Price now over the create price, as bps: window. */
   minRunupBps: number;
   maxRunupBps: number;
-  /** The recent-flow window (slots) and what it must show. */
-  flowWindow: number;
-  minFlowLamports: number;
-  minRecentBuyers: number;
   /** Creator sold before entry: skip the coin. */
   skipDevSold: boolean;
   /** Slippage allowed on buys (bps): a buy whose price jumps more than this in the latency is refused. */
@@ -60,15 +68,10 @@ export interface Params {
   tpRungs: TpRung[];
   /** Exit when the position is worth this much under its cost (bps). */
   hardStopBps: number;
-  /** Trailing stop: once up at least trailArmBps, exit on a fall of trailBps from the best value. */
-  trailArmBps: number;
-  trailBps: number;
   /** Exit after holding this many slots. */
   maxHold: number;
   /** Exit when the creator sells while held. */
   exitOnDevSell: boolean;
-  /** Exit when no trade has hit the coin for this many slots. */
-  staleSlots: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
@@ -81,32 +84,19 @@ export const DEFAULT_PARAMS: Params = {
   minDevBuy: 0,
   maxDevBuy: 1_500_000_000,
   minBuyers: 7,
-  maxSellRatioBps: 10_000,
-  maxBigSellBps: 10_000,
+  maxSellRatioBps: 5_000,
+  maxBigSellBps: 3_000,
   // NOTE: run-up is the absolute price ratio in bps (10000 = 1.00x the
   // create price), so "run-up 0-60%" is 10000-16000, not 0-6000.
   minRunupBps: 10000,
   maxRunupBps: 16000,
-  flowWindow: 10,
-  minFlowLamports: 0,
-  minRecentBuyers: 0,
   skipDevSold: true,
   buySlippageBps: 10_000,
   tpRungs: [{ bps: 1500, partBps: 10000 }],
-  hardStopBps: 800,
-  trailArmBps: 1000000,
-  trailBps: 1000,
+  hardStopBps: 1000,
   maxHold: 10,
   exitOnDevSell: true,
-  staleSlots: 1000000,
 };
-
-interface Tick {
-  slot: number;
-  isBuy: boolean;
-  sol: bigint;
-  user: Pubkey;
-}
 
 interface Coin {
   mint: Pubkey;
@@ -122,9 +112,6 @@ interface Coin {
   soldByOthers: bigint;
   bigSellBps: bigint;
   devSold: boolean;
-  lastTradeSlot: number;
-  /** Trades of the last flowWindow slots (older ones dropped as new ones come). */
-  recent: Tick[];
   buysSent: number;
   /** Never buy it again (bought, exited, filtered out for good, or completed). */
   done: boolean;
@@ -134,7 +121,6 @@ interface Coin {
 interface Held {
   openedSlot: number;
   txPaid: bigint;
-  best: bigint;
   devSoldAtOpen: boolean;
   /** Index of the next take-profit rung not yet taken. */
   nextRung: number;
@@ -176,8 +162,6 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           soldByOthers: 0n,
           bigSellBps: 0n,
           devSold: false,
-          lastTradeSlot: e.slot,
-          recent: [],
           buysSent: 0,
           done: false,
           complete: false,
@@ -187,8 +171,6 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (c === undefined) continue;
         const sol = BigInt(e.sol_amount);
         c.trades += 1;
-        c.lastTradeSlot = e.slot;
-        c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
         const isDev = e.user === c.creator;
         if (e.is_buy) {
           c.bought += sol;
@@ -212,23 +194,6 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
       }
     }
-  }
-
-  /** Net lamports bought minus sold and the distinct buyers, over the last flowWindow slots. */
-  function flow(c: Coin, slot: number): { net: bigint; buyers: number } {
-    const from = slot - P.flowWindow;
-    let drop = 0;
-    while (drop < c.recent.length && c.recent[drop]!.slot <= from) drop++;
-    if (drop > 0) c.recent.splice(0, drop);
-    let net = 0n;
-    const buyers = new Set<Pubkey>();
-    for (const t of c.recent) {
-      if (t.isBuy) {
-        net += t.sol;
-        if (t.user !== c.creator) buyers.add(t.user);
-      } else net -= t.sol;
-    }
-    return { net, buyers: buyers.size };
   }
 
   function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
@@ -259,7 +224,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         const h = held.get(f.mint);
         if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
         if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, nextRung: 0 });
+          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, nextRung: 0 });
         }
       }
       for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
@@ -274,7 +239,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         const c = coins.get(mint);
         let h = held.get(mint);
         if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false, nextRung: 0 };
+          h = { openedSlot: state.slot, txPaid: tx, devSoldAtOpen: c?.devSold ?? false, nextRung: 0 };
           held.set(mint, h);
         }
         let mk = marks.get(mint);
@@ -285,7 +250,6 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
         const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
         const basis = pos.cost_lamports + h.txPaid;
-        if (value > h.best) h.best = value;
         if (basis <= 0n) continue;
         // Take-profit ladder: sell one rung at a time, then wait for its fill.
         const rung = P.tpRungs[h.nextRung];
@@ -305,11 +269,9 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
         let exit = false;
         if (value * BPS <= basis * (BPS - BigInt(P.hardStopBps))) exit = true;
-        if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
         if (state.slot - h.openedSlot >= P.maxHold) exit = true;
         if (c !== undefined) {
           if (P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-          if (state.slot - c.lastTradeSlot >= P.staleSlots) exit = true;
         }
         if (!exit) continue;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
@@ -345,8 +307,6 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (c.bigSellBps > BigInt(P.maxBigSellBps)) continue;
         const runup = (curve.virtual_quote_reserves * c.vt0 * BPS) / (curve.virtual_token_reserves * c.vq0);
         if (runup > BigInt(P.maxRunupBps) || runup < BigInt(P.minRunupBps)) continue;
-        const fl = flow(c, state.slot);
-        if (fl.net < BigInt(P.minFlowLamports) || fl.buyers < P.minRecentBuyers) continue;
         const amount = BigInt(P.stakeLamports) < state.maxBuyLamports(c.mint) ? BigInt(P.stakeLamports) : state.maxBuyLamports(c.mint);
         if (amount < BigInt(P.minBuyLamports)) continue;
         if (free < amount + tx) continue;
